@@ -587,8 +587,13 @@ void instruction_decode(
                 while(bytes_remaining > 0){
                     //emit rx seek queries until one returns true
                     do{
-                        STREAM_WRITE(rxbuf_req, ((rxbuf_signature){.tag=insn.rx_tag, .len=bytes_remaining, .src=insn.rx_src, .seqn=inbound_seqn}));
-                        seek_res = STREAM_READ(rxbuf_ack);
+                        // The request must leave before its acknowledgement is awaited.
+                        rx_lookup: {
+                            #pragma HLS protocol fixed
+                            STREAM_WRITE(rxbuf_req, ((rxbuf_signature){.tag=insn.rx_tag, .len=bytes_remaining, .src=insn.rx_src, .seqn=inbound_seqn}));
+                            ap_wait();
+                            seek_res = STREAM_READ(rxbuf_ack);
+                        }
                     }while(!seek_res.valid);
                     dm1_rd.addr = seek_res.addr;
                     dm1_rd.total_bytes = seek_res.len;
