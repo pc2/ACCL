@@ -26,7 +26,7 @@ void dma2seg_cmd(STREAM<ap_axiu<104,0,0,DEST_WIDTH> > & dma_cmd_in,
 #pragma HLS INTERFACE axis register both port=dma_cmd_out
 #pragma HLS INTERFACE axis register both port=seg_cmd
 #pragma HLS INTERFACE ap_ctrl_none port=return
-#pragma HLS PIPELINE II=1
+#pragma HLS PIPELINE II=1 style=flp
 	segmenter_cmd cmd;
 	// get DMA command from upstream
 	ap_axiu<104,0,0,DEST_WIDTH> dma_cmd = STREAM_READ(dma_cmd_in);
