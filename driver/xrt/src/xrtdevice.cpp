@@ -181,6 +181,7 @@ void FPGARequest::start() {
       break;
     case ACCL::operation::config:
       run.set_arg(ACCL::XRT_ARG_ID::SCENARIO_ID, static_cast<uint32_t>(options.scenario));
+      run.set_arg(ACCL::XRT_ARG_ID::COUNT_ID, static_cast<uint32_t>(options.count));
       run.set_arg(ACCL::XRT_ARG_ID::FUNCTION_ID, static_cast<uint32_t>(function));
       break;
     case ACCL::operation::nop:
