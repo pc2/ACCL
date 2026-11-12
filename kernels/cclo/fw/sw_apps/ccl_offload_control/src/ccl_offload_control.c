@@ -1896,8 +1896,6 @@ int allreduce(
             //instead of Xil_In32 we could use:
             //(datapath_arith_config*)(arcfg_offset)->uncompressed_elem_bytes;
             max_seg_count = eager_rx_buf_size / datatype_nbytes;
-            // Round max segment size down to align with world size
-            max_seg_count -= max_seg_count % world.size;
         }
 
         next_in_ring = (world.local_rank + 1) % world.size;
@@ -1906,9 +1904,8 @@ int allreduce(
         for (elems_remaining = count; elems_remaining > 0; elems_remaining -= elems) {
             elems = min(max_seg_count, elems_remaining);
 
-            //we need to break the input into world.size chunks of equal size
-            //if count does not divide by world.size, the chunk with the largest index (tail) will be smaller
-            bulk_count = (elems + world.size - 1) / world.size;//equivalent to ceil(elems/world.size)
+            // The final chunk carries the remainder without exceeding the segment.
+            bulk_count = elems / world.size;
             tail_count = elems - bulk_count * (world.size - 1);
 
             //preamble: send our data to next in ring
@@ -1942,6 +1939,8 @@ int allreduce(
             for (i = 0; i < world.size - 1; i++) {
                 rel_stride = bulk_count*((curr_pos == 0) ? (world.size-1) : -1);
                 curr_count = (curr_pos == 0) ? tail_count : bulk_count;
+                // Empty chunks update addresses without requesting a receive.
+                unsigned int receive_mode = curr_count ? MOVE_ON_RECV : MOVE_NONE;
 
                 //simultaneous receive, reduce and send for the received chunk,
                 //unless it is the last step, in which case we don't send, but save locally
@@ -1954,7 +1953,7 @@ int allreduce(
                     //goes out to network
                     tmp_compression = (compression & OP0_COMPRESSED) | ((compression & ETH_COMPRESSED) >> 2) | ((compression & ETH_COMPRESSED) >> 1);
                     start_move(
-                        MOVE_STRIDE, MOVE_ON_RECV, MOVE_IMMEDIATE,
+                        MOVE_STRIDE, receive_mode, MOVE_IMMEDIATE,
                         pack_flags(tmp_compression, RES_REMOTE, host & OP0_HOST),
                         func,
                         curr_count,
@@ -1967,7 +1966,7 @@ int allreduce(
                     //so we must set OP1_COMPRESSED here. Also keep RES_COMPRESSED and OP0_COMPRESSED the same.
                     tmp_compression = compression | ((compression & ETH_COMPRESSED) >> 2);
                     start_move(
-                        MOVE_STRIDE, MOVE_ON_RECV, MOVE_STRIDE,
+                        MOVE_STRIDE, receive_mode, MOVE_STRIDE,
                         pack_flags(tmp_compression, RES_LOCAL, host & (OP0_HOST | RES_HOST)),
                         func,
                         curr_count,
@@ -2017,6 +2016,7 @@ int allreduce(
             for (i = 0; i < world.size - 1; i++) {
                 rel_stride = bulk_count * ((curr_pos == 0) ? (world.size - 1) : -1);
                 curr_count = (curr_pos == 0) ? tail_count : bulk_count;
+                unsigned int receive_mode = curr_count ? MOVE_ON_RECV : MOVE_NONE;
 
                 //we use a blocking move here, because we want to avoid a race condition with the relay below
                 //TODO: avoid this; we either need to solve the RAW dependency in hardware (the generic approach),
@@ -2024,7 +2024,7 @@ int allreduce(
                 //e.g. MOVE_ON_RECV_KEEP which would keep the RX buffer in the pending state
                 tmp_compression = (compression & RES_COMPRESSED) | ((compression & ETH_COMPRESSED) >> 2);
                 err |= move(
-                    MOVE_NONE, MOVE_ON_RECV, MOVE_STRIDE,
+                    MOVE_NONE, receive_mode, MOVE_STRIDE,
                     pack_flags(tmp_compression, RES_LOCAL, host & RES_HOST),
                     0,
                     curr_count,
