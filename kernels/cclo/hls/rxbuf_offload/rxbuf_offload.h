@@ -30,6 +30,7 @@ typedef struct {
 
 typedef struct {
     bool active;
+    bool first_fragment;
     unsigned int buf_index;
     ap_uint<DEST_WIDTH> mem_index;
     ap_uint<64> address;

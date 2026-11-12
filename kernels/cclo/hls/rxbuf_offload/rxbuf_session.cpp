@@ -92,8 +92,10 @@ void rxbuf_session_command(
                 desc.remaining -= notif.length;
                 //command the status parser
                 sts_command.index = notif.session_id;
+                sts_command.first = desc.first_fragment;
                 sts_command.last = (desc.remaining == 0);
                 STREAM_WRITE(status_instruction, sts_command);
+                desc.first_fragment = false;
                 //if remaining is zero, flush
                 if(desc.remaining == 0){
                     STREAM_WRITE(rxbuf_idx_out, desc.buf_index);
@@ -101,21 +103,18 @@ void rxbuf_session_command(
                     desc.active = false;
                 }
             }
-            //prime the command to status parser
-            sts_command.first = false;
         } else {
             //this is a SOM notification so descriptor does not exist, initialize
             auto rxbuf_dma_cmd_word = STREAM_READ(rxbuf_dma_cmd);
             cmd = hlslib::axi::Command<64, 23>(rxbuf_dma_cmd_word.data);//{undex, current write address, bytes remaining, header}
             desc.active = true;
+            desc.first_fragment = true;
             desc.buf_index = STREAM_READ(rxbuf_idx_in);
             desc.mem_index = rxbuf_dma_cmd_word.dest;
             desc.address = cmd.address;
             //store header
 	        desc.header = STREAM_READ(eth_hdr_in);
             desc.remaining = desc.header.count;
-            //prime the command to status parser
-            sts_command.first = true;
         }
         //store descriptor
         mem[notif.session_id] = desc;
