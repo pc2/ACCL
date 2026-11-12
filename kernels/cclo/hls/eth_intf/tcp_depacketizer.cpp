@@ -14,138 +14,194 @@
 #  limitations under the License.
 #
 # *******************************************************************************/
-#include "ap_axi_sdata.h"
-#include "ap_int.h"
 #include "eth_intf.h"
-#ifndef ACCL_SYNTHESIS
-#include "log.hpp"
 
-extern Log logger;
-#endif
+struct tcp_receive_context {
+  ap_uint<DATA_WIDTH> partial;
+  ap_uint<7> partial_bytes;
+  unsigned remaining;
+  ap_uint<DEST_WIDTH> target;
+};
 
-using namespace std;
+using tcp_byte_count = ap_uint<7>;
+using tcp_buffer_count = ap_uint<6>;
 
-//how this works:
-//read a notification from notif_in which says we'll get B bytes for session S
-//check how many bytes remaining for any ongoing messages on session S
-//if remaining[S] == 0
-//    it means we're getting the start of a new message, so
-//        get the header from the input data stream, indicating how many bytes M are in the message, and destination stream strm
-//        check strm in header; if strm is zero:
-//            copy the notification to the notif_out stream
-//            copy the header to sts
-//            subtract 64 from B
-//        copy all B remaining bytes from in to out, with dest = strm, decrementing M along the way
-//else
-//    it means we're continuing a previous message on this session, so
-//    copy min(remaining[S], B) from in to out, with dest = strm, decrementing remaining[S] along the way
-//    if strm is zero:
-//        copy the notification to the notif_out stream
-//remaining[S] = {M, strm}
-//if bytes still remaining for this notification, start over without reading notif (keep old notif, with adjusted B)
+static ap_uint<DATA_WIDTH / 8> tcp_byte_keep(tcp_byte_count bytes) {
+#pragma HLS INLINE
+  ap_uint<DATA_WIDTH / 8> keep = 0;
+  for (unsigned byte = 0; byte < DATA_WIDTH / 8; ++byte) {
+#pragma HLS UNROLL
+    keep[byte] = byte < bytes;
+  }
+  return keep;
+}
 
-void tcp_depacketizer(
-	STREAM<stream_word > & in,
-	STREAM<stream_word > & out,
-	STREAM<eth_header > & sts,
-    STREAM<eth_notification> &notif_in,
-    STREAM<eth_notification> &notif_out
-) {
-#pragma HLS INTERFACE axis register both port=in
-#pragma HLS INTERFACE axis register both port=out
-#pragma HLS INTERFACE axis register both port=sts
-#pragma HLS INTERFACE axis register both port=notif_in
-#pragma HLS INTERFACE axis register both port=notif_out
-#pragma HLS INTERFACE s_axilite port=return
-#pragma HLS PIPELINE II=1 style=flp
-	
-	unsigned constexpr bytes_per_word = DATA_WIDTH/8;
-	unsigned const max_dma_bytes = 8*1024*1024-1;//TODO: convert to argument?
+static ap_uint<DATA_WIDTH> tcp_byte_mask(tcp_byte_count bytes) {
+#pragma HLS INLINE
+  ap_uint<DATA_WIDTH> mask = 0;
+  for (unsigned byte = 0; byte < DATA_WIDTH / 8; ++byte) {
+#pragma HLS UNROLL
+    mask.range(byte * 8 + 7, byte * 8) = byte < bytes ? 255 : 0;
+  }
+  return mask;
+}
 
-	static unsigned int remaining[1024] = {0};//one RAMB36 for max 1024 sessions
-	static ap_uint<DEST_WIDTH> target_strm[1024] = {0};//one RAMB18 for max 1024 sessions
+static ap_uint<DATA_WIDTH> tcp_take_bytes(STREAM<stream_word> &input,
+                                          ap_uint<2 * DATA_WIDTH> &buffer,
+                                          tcp_buffer_count &buffered,
+                                          unsigned &available,
+                                          tcp_byte_count bytes) {
+#pragma HLS INLINE
+  const unsigned word_bytes = DATA_WIDTH / 8;
+  if (buffered < bytes) {
+    stream_word word = STREAM_READ(input);
+    buffer |= ap_uint<2 * DATA_WIDTH>(word.data) << (buffered * 8);
+  }
+  ap_uint<DATA_WIDTH> result = buffer;
+  if (bytes < word_bytes) {
+    result &= tcp_byte_mask(bytes);
+  }
+  buffer >>= bytes * 8;
+  // Availability limits valid data, the buffer count wraps modulo 64 bytes.
+  buffered -= bytes;
+  available -= bytes;
+  return result;
+}
 
-	static eth_notification notif;
-	static bool continue_notif = false;
-	static bool continue_message = false;
+static void tcp_emit_payload(STREAM<stream_word> &output,
+                             tcp_receive_context &context,
+                             ap_uint<DATA_WIDTH> data, tcp_byte_count bytes,
+                             bool last_fragment_word) {
+#pragma HLS INLINE
+  const unsigned word_bytes = DATA_WIDTH / 8;
+  context.remaining -= bytes;
+  stream_word word;
+  word.dest = context.target;
+  if (context.target == 0) {
+    word.data = data;
+    word.keep = tcp_byte_keep(bytes);
+    word.strb = word.keep;
+    word.last = last_fragment_word;
+    STREAM_WRITE(output, word);
+  } else {
+    ap_uint<2 * DATA_WIDTH> combined = context.partial;
+    combined |= ap_uint<2 * DATA_WIDTH>(data) << (context.partial_bytes * 8);
+    unsigned total = context.partial_bytes + bytes;
+    if (total >= word_bytes) {
+      word.data = combined;
+      word.keep = -1;
+      word.strb = word.keep;
+      word.last = context.remaining == 0 && total == word_bytes;
+      STREAM_WRITE(output, word);
+      context.partial = combined >> DATA_WIDTH;
+      context.partial_bytes = total - word_bytes;
+    } else {
+      context.partial = combined;
+      context.partial_bytes = total;
+    }
+  }
+}
 
-	static unsigned int message_rem = 0;
-	static ap_uint<DEST_WIDTH> message_strm = 0;
-	static unsigned int prev_session_id = 0;
-	unsigned int current_bytes = 0;
+void tcp_depacketizer(STREAM<stream_word> &in, STREAM<stream_word> &out,
+                      STREAM<eth_header> &sts,
+                      STREAM<eth_notification> &notif_in,
+                      STREAM<eth_notification> &notif_out) {
+#pragma HLS INTERFACE axis register both port = in
+#pragma HLS INTERFACE axis register both port = out
+#pragma HLS INTERFACE axis register both port = sts
+#pragma HLS INTERFACE axis register both port = notif_in
+#pragma HLS INTERFACE axis register both port = notif_out
+#pragma HLS INTERFACE s_axilite port = return
 
-	stream_word inword;
-	eth_header hdr;
-	eth_notification downstream_notif;
+  const unsigned word_bytes = DATA_WIDTH / 8;
+  const unsigned max_dma_bytes =
+      ((8 * 1024 * 1024 - 1) / word_bytes) * word_bytes;
+  static tcp_receive_context contexts[1024] = {};
+  if (STREAM_IS_EMPTY(notif_in)) {
+    return;
+  }
+  eth_notification notification = STREAM_READ(notif_in);
+  if (notification.length == 0) {
+    return;
+  }
+  unsigned available = notification.length;
+  tcp_receive_context context = contexts[notification.session_id];
+  ap_uint<2 * DATA_WIDTH> buffer = 0;
+  tcp_buffer_count buffered = 0;
+  while (available != 0) {
+    if (context.remaining == 0) {
+      unsigned bytes = word_bytes - context.partial_bytes;
+      if (bytes > available) {
+        bytes = available;
+      }
+      auto data = tcp_take_bytes(in, buffer, buffered, available, bytes);
+      context.partial |= data << (context.partial_bytes * 8);
+      context.partial_bytes += bytes;
+      if (context.partial_bytes != word_bytes) {
+        break;
+      }
+      eth_header header(context.partial.range(HEADER_LENGTH - 1, 0));
+      context.remaining = header.count;
+      context.target = header.strm;
+      context.partial = 0;
+      context.partial_bytes = 0;
+      if (context.remaining != 0 && context.target == 0) {
+        eth_notification notice;
+        notice.session_id = notification.session_id;
+        notice.type = 0;
+        notice.length = context.remaining;
+        STREAM_WRITE(sts, header);
+        STREAM_WRITE(notif_out, notice);
+      }
+      if (context.remaining == 0 || available == 0) {
+        continue;
+      }
+    }
 
-	if(STREAM_IS_EMPTY(notif_in) && STREAM_IS_EMPTY(in)) return;
-
-	//get new notification unless we're continuing an old one or a message
-	if(!continue_notif && !continue_message){
-		notif = STREAM_READ(notif_in);
-	}
-
-#ifndef ACCL_SYNTHESIS
-	std::stringstream ss;
-	ss << "TCP Depacketizer: Processing incoming fragment count=" << notif.length << " for session " << notif.session_id << "\n";
-	logger << log_level::verbose << ss.str();
-#endif
-
-	//get remaining message bytes, from local storage
-	//TODO: cache latest accessed value
-	if(prev_session_id != notif.session_id){
-		message_rem = remaining[notif.session_id];
-	}
-	
-	downstream_notif.session_id = notif.session_id;
-	if(message_rem == 0){//if remaining bytes is zero, then this is the start of a new message
-		//get header and some important info from it
-		inword = STREAM_READ(in);
-		hdr = eth_header(inword.data(HEADER_LENGTH-1,0));
-		message_rem = hdr.count;//length of upcoming message (excluding the header itself)
-		message_strm = hdr.strm;//target of message (0 is targeting memory so managed, everything else is  stream so unmanaged)
-		if(message_strm == 0){
-			//put notification, header in output streams
-			STREAM_WRITE(sts, hdr);
-			downstream_notif.type = 0; //for SOM
-			downstream_notif.length = hdr.count;
-			STREAM_WRITE(notif_out, downstream_notif);
-		}
-		//decrement the length to reflect the fact that we have removed the 64B header
-		//Note: the rxHandler must make sure to not give us fragments less than 64B
-		notif.length -= bytes_per_word;
-		target_strm[notif.session_id] = message_strm;
-	} else{//if remaining bytes is not zero, then this is a continuation of an old message
-		message_strm = target_strm[notif.session_id];
-	}
-	//write out notifications
-	//in case the fragment spans the end of the current message and beginning of another,
-	//only notify for the part up to the end of the current message
-	if(message_strm == 0){
-		downstream_notif.type = 1; //for SOF
-		downstream_notif.length = notif.length;
-		STREAM_WRITE(notif_out, downstream_notif);
-	}
-	//copy data in -> out
-	do{
-		#pragma HLS PIPELINE II=1
-		inword = STREAM_READ(in);
-		inword.dest = message_strm;
-		STREAM_WRITE(out, inword);
-		notif.length = (notif.length < bytes_per_word) ? 0u : (unsigned int)notif.length-bytes_per_word;//floor at zero
-		current_bytes += (message_rem < bytes_per_word) ? message_rem : bytes_per_word;
-		message_rem = (message_rem < bytes_per_word) ? 0u : message_rem-bytes_per_word;//slight problem here if the message doesnt end on a 64B boundary...
-	} while(notif.length > 0 && message_rem > 0 && current_bytes < (max_dma_bytes-bytes_per_word));
-	if(message_strm == 0){
-		downstream_notif.type = 2; //for EOF
-		downstream_notif.length = current_bytes;
-		STREAM_WRITE(notif_out, downstream_notif);
-	}
-	//update session info (remaining bytes and target of currently processing message)
-	remaining[notif.session_id] = message_rem;
-	//if we're not finished with this fragment, skip notification read on the next run
-	continue_notif = (notif.length > 0);
-	continue_message = (notif.length > 0) && (message_rem > 0);
-	//update session id for caching
-	prev_session_id = notif.session_id;
+    unsigned fragment_bytes = context.remaining;
+    if (fragment_bytes > available) {
+      fragment_bytes = available;
+    }
+    if (fragment_bytes > max_dma_bytes) {
+      fragment_bytes = max_dma_bytes;
+    }
+    eth_notification notice;
+    notice.session_id = notification.session_id;
+    notice.length = fragment_bytes;
+    if (context.target == 0) {
+      notice.type = 1;
+      STREAM_WRITE(notif_out, notice);
+    }
+    ap_uint<17> full_words = fragment_bytes / word_bytes;
+    tcp_byte_count tail_bytes = fragment_bytes % word_bytes;
+    for (ap_uint<17> index = 0; index < full_words; ++index) {
+#pragma HLS PIPELINE II = 1
+      tcp_buffer_count word_buffered = buffered;
+      auto data =
+          tcp_take_bytes(in, buffer, word_buffered, available, word_bytes);
+      tcp_emit_payload(out, context, data, word_bytes,
+                       index + 1 == full_words && tail_bytes == 0);
+    }
+    if (tail_bytes != 0) {
+      auto data = tcp_take_bytes(in, buffer, buffered, available, tail_bytes);
+      tcp_emit_payload(out, context, data, tail_bytes, true);
+    }
+    if (context.target != 0 && context.remaining == 0 &&
+        context.partial_bytes != 0) {
+      stream_word word;
+      word.dest = context.target;
+      word.data = context.partial;
+      word.keep = tcp_byte_keep(context.partial_bytes);
+      word.strb = word.keep;
+      word.last = 1;
+      STREAM_WRITE(out, word);
+      context.partial = 0;
+      context.partial_bytes = 0;
+    }
+    if (context.target == 0) {
+      notice.type = 2;
+      STREAM_WRITE(notif_out, notice);
+    }
+  }
+  contexts[notification.session_id] = context;
 }
