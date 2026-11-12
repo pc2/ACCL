@@ -273,7 +273,7 @@ CCLO::deviceType XRTDevice::get_device_type() {
 val_t XRTDevice::get_retcode(ACCLRequest *request) {
   auto fpga_handle = request_map.find(*request);
 
-  if (fpga_handle != request_map.end())
+  if (fpga_handle == request_map.end())
     return 0;
   
   return fpga_handle->second->get_retcode();
