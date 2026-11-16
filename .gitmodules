@@ -20,7 +20,7 @@
 	url = https://github.com/Xilinx/xup_vitis_network_example.git
 [submodule "demo/build/Vitis_with_100Gbps_TCP-IP"]
 	path = test/refdesigns/Vitis_with_100Gbps_TCP-IP
-	url = https://github.com/fpgasystems/Vitis_with_100Gbps_TCP-IP.git
+	url = https://github.com/pc2/Vitis_with_100Gbps_TCP-IP.git
 [submodule "hlslib"]
 	path = hlslib
 	url = https://github.com/quetric/hlslib.git
